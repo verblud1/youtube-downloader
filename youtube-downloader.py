@@ -1,12 +1,11 @@
 import os
-import threading
+import shutil
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor
 import customtkinter as ctk
 from yt_dlp import YoutubeDL
 
-# Настройка темы оформления
-ctk.set_appearance_mode("System")
-ctk.set_default_color_theme("blue")
+ctk.set_appearance_mode("Dark")
 
 
 class YoutubeDownloaderApp(ctk.CTk):
@@ -14,159 +13,279 @@ class YoutubeDownloaderApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        # Настройка окна
-        self.title("YouTube Downloader")
-        self.geometry("600x340")
-        self.resizable(False, False)
+        self.bg_color = "#000000"
 
-        # Путь сохранения по умолчанию — папка "Загрузки"
+        # Настройка окна
+        self.title("Multi YouTube Downloader")
+        self.geometry("650x500")  # Увеличили высоту под список ссылок
+        self.resizable(False, False)
+        self.configure(fg_color=self.bg_color)
+
         self.download_path = os.path.join(os.path.expanduser("~"), "Downloads")
+
+        # Пул потоков для параллельного скачивания (макс. 3 одновременных задачи)
+        self.executor = ThreadPoolExecutor(max_workers=3)
+
+        # Список для хранения объектов (словарей) каждого поля ввода
+        # Структура: {"frame": CTkFrame, "entry": CTkEntry, "progress": CTkProgressBar, "status": CTkLabel}
+        self.download_rows = []
 
         # Инициализация интерфейса
         self.create_widgets()
-
-        # Создаем контекстное меню для ПКМ
         self.create_context_menu()
 
-        # МЕХАНИКА 1: Безопасная автоподстановка при старте окна
+        # Проверка зависимостей
+        self.check_system_dependencies()
+
+        # Добавляем первое поле по умолчанию
+        self.add_download_row()
+
+        # Автоподстановка из буфера в первое поле
         self.after(200, self.check_clipboard_on_start)
 
     def create_widgets(self):
         # Заголовок
         self.title_label = ctk.CTkLabel(
             self,
-            text="Скачивание видео в максимальном качестве",
+            text="Мультипоточное скачивание видео",
             font=("Arial", 16, "bold"),
+            text_color="#FFFFFF",
+            fg_color=self.bg_color,
         )
         self.title_label.pack(pady=15)
 
-        # Поле ввода URL
-        # МЕХАНИКА 2: Ctrl + V / Cmd + V работает здесь автоматически на уровне ОС
-        self.url_entry = ctk.CTkEntry(
-            self,
-            width=500,
-            placeholder_text="Вставьте ссылку на YouTube видео здесь...",
-        )
-        self.url_entry.pack(pady=10)
-
-        # МЕХАНИКА 3: Привязка клика ПКМ для вызова контекстного меню
-        self.url_entry.bind("<Button-3>", self.show_context_menu)
-        self.url_entry.bind(
-            "<Button-2>", self.show_context_menu
-        )  # Для пользователей Mac
-
-        # Выбор папки для сохранения
-        self.path_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.path_frame.pack(pady=5, fill="x", padx=50)
+        # Панель управления (Выбор папки и кнопка "+")
+        self.control_frame = ctk.CTkFrame(self, fg_color=self.bg_color)
+        self.control_frame.pack(pady=5, fill="x", padx=40)
 
         self.path_label = ctk.CTkLabel(
-            self.path_frame,
+            self.control_frame,
             text=f"Папка: {self.download_path}",
             font=("Arial", 11),
-            text_color="gray",
+            text_color="#BBBBBB",
         )
         self.path_label.pack(side="left", padx=5)
 
         self.path_button = ctk.CTkButton(
-            self.path_frame,
-            text="Изменить",
-            width=80,
-            height=24,
+            self.control_frame,
+            text="Изменить папку",
+            width=120,
+            height=28,
             command=self.choose_path,
+            fg_color="#111111",
+            hover_color="#1A1A1A",
+            text_color="#FFFFFF",
+            border_color="#333333",
+            border_width=1,
         )
         self.path_button.pack(side="right", padx=5)
 
-        # Индикатор прогресса
-        self.progress_bar = ctk.CTkProgressBar(self, width=500)
-        self.progress_bar.set(0)
-        self.progress_bar.pack(pady=15)
-
-        # Текстовый статус
-        self.status_label = ctk.CTkLabel(
-            self, text="Готов к работе", font=("Arial", 12), text_color="gray"
+        self.add_button = ctk.CTkButton(
+            self.control_frame,
+            text="+ Добавить ссылку",
+            width=130,
+            height=28,
+            command=self.add_download_row,
+            fg_color="#27AE60",
+            hover_color="#219653",
+            text_color="#FFFFFF",
         )
-        self.status_label.pack(pady=5)
+        self.add_button.pack(side="right", padx=10)
 
-        # Кнопка СКАЧАТЬ
+        # Системные зависимости (FFmpeg / Node.js)
+        self.deps_frame = ctk.CTkFrame(self, fg_color=self.bg_color)
+        self.deps_frame.pack(pady=5)
+
+        self.ffmpeg_label = ctk.CTkLabel(
+            self.deps_frame,
+            text="FFmpeg: Проверка...",
+            font=("Arial", 10, "bold"),
+            text_color="#F39C12",
+        )
+        self.ffmpeg_label.pack(side="left", padx=15)
+
+        self.nodejs_label = ctk.CTkLabel(
+            self.deps_frame,
+            text="Node.js: Проверка...",
+            font=("Arial", 10, "bold"),
+            text_color="#F39C12",
+        )
+        self.nodejs_label.pack(side="left", padx=15)
+
+        # ПРОКРУЧИВАЕМЫЙ ФРЕЙМ ДЛЯ СПИСКА ССЫЛОК
+        self.scroll_frame = ctk.CTkScrollableFrame(
+            self,
+            width=580,
+            height=220,
+            fg_color="#050505",
+            border_color="#111111",
+            border_width=1,
+        )
+        self.scroll_frame.pack(pady=10, padx=20)
+
+        # Кнопка СКАЧАТЬ ВСЁ
         self.download_button = ctk.CTkButton(
             self,
-            text="Скачать видео",
+            text="Скачать все видео",
             font=("Arial", 14, "bold"),
-            command=self.start_download_thread,
+            command=self.start_all_downloads,
+            fg_color="#111111",
+            hover_color="#1A1A1A",
+            text_color="#FFFFFF",
+            border_color="#333333",
+            border_width=1,
         )
         self.download_button.pack(pady=15)
 
+    def add_download_row(self):
+        """Динамически добавляет новую строку для скачивания (Поле + Прогресс-бар + Кнопка удаления)."""
+        row_frame = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
+        row_frame.pack(fill="x", pady=5)
+
+        # Контейнер для упорядочивания элементов внутри строки
+        entry_and_del = ctk.CTkFrame(row_frame, fg_color="transparent")
+        entry_and_del.pack(fill="x")
+
+        entry = ctk.CTkEntry(
+            entry_and_del,
+            placeholder_text="Вставьте ссылку на YouTube...",
+            fg_color="#080808",
+            border_color="#222222",
+            text_color="#DDDDDD",
+            width=460,
+        )
+        entry.pack(side="left", padx=(5, 5))
+
+        # Привязываем контекстное меню к новому полю
+        entry.bind("<Button-3>", self.show_context_menu)
+        entry.bind("<Button-2>", self.show_context_menu)
+
+        # Кнопка удаления строки (доступна, только если это не единственная строка)
+        delete_btn = ctk.CTkButton(
+            entry_and_del,
+            text="✕",
+            width=30,
+            height=28,
+            fg_color="#C0392B",
+            hover_color="#A93226",
+            command=lambda: self.remove_download_row(row_dict),
+        )
+        delete_btn.pack(side="right", padx=5)
+
+        # Индикатор прогресса и статус для конкретной строки
+        status_bar_frame = ctk.CTkFrame(row_frame, fg_color="transparent")
+        status_bar_frame.pack(fill="x", pady=(2, 5))
+
+        progress = ctk.CTkProgressBar(
+            status_bar_frame, width=320, progress_color="#FFFFFF", fg_color="#0F0F0F"
+        )
+        progress.set(0)
+        progress.pack(side="left", padx=5)
+
+        status = ctk.CTkLabel(
+            status_bar_frame,
+            text="Ожидание ссылки",
+            font=("Arial", 10),
+            text_color="#888888",
+        )
+        status.pack(side="left", padx=10)
+
+        # Сохраняем все ссылки на виджеты строки в словарь
+        row_dict = {
+            "frame": row_frame,
+            "entry": entry,
+            "progress": progress,
+            "status": status,
+            "delete_btn": delete_btn,
+        }
+        self.download_rows.append(row_dict)
+
+        # Если строка стала больше одной, включаем кнопки удаления у остальных
+        self.update_delete_buttons_state()
+
+    def remove_download_row(self, row_dict):
+        """Удаляет строку из интерфейса и из списка."""
+        if len(self.download_rows) > 1:
+            row_dict["frame"].destroy()
+            self.download_rows.remove(row_dict)
+            self.update_delete_buttons_state()
+
+    def update_delete_buttons_state(self):
+        """Блокирует кнопку удаления, если осталась всего одна строка."""
+        state = "normal" if len(self.download_rows) > 1 else "disabled"
+        for row in self.download_rows:
+            row["delete_btn"].configure(state=state)
+
+    def check_system_dependencies(self):
+        if shutil.which("ffmpeg"):
+            self.ffmpeg_label.configure(text="FFmpeg: ОК", text_color="#27AE60")
+            self.ffmpeg_available = True
+        else:
+            self.ffmpeg_label.configure(
+                text="FFmpeg: НЕ НАЙДЕН (Качество 720p)", text_color="#C0392B"
+            )
+            self.ffmpeg_available = False
+
+        if shutil.which("node"):
+            self.nodejs_label.configure(text="Node.js: ОК", text_color="#27AE60")
+        else:
+            self.nodejs_label.configure(
+                text="Node.js: НЕ НАЙДЕН (Возможны ошибки)", text_color="#C0392B"
+            )
+
     def create_context_menu(self):
-        """Создает контекстное меню (tk.Menu)."""
-        self.context_menu = tk.Menu(self, tearoff=0)
+        self.context_menu = tk.Menu(
+            self,
+            tearoff=0,
+            background="#000000",
+            foreground="#FFFFFF",
+            activebackground="#222222",
+            activeforeground="#FFFFFF",
+        )
         self.context_menu.add_command(
             label="Вставить", command=self.paste_from_clipboard
         )
         self.context_menu.add_command(label="Очистить", command=self.clear_entry)
 
     def show_context_menu(self, event):
-        """Отображает контекстное меню в месте клика."""
-        self.url_entry.focus()
+        self.active_entry = event.widget  # Запоминаем, на каком поле кликнули
+        self.active_entry.focus()
         self.context_menu.tk_popup(event.x_root, event.y_root)
 
     def is_valid_youtube_link(self, text):
-        """Проверяет, является ли текст безопасным для вставки и похож ли он на ссылку."""
-        if not text:
+        if not text or len(text) > 250 or "\n" in text or "\r" in text:
             return False
-
-        # Защита от гигантского текста: ссылка не бывает длиннее 250 символов
-        if len(text) > 250:
-            return False
-
-        # Защита от многострочного текста: ссылка всегда в одну строку
-        if "\n" in text or "\r" in text:
-            return False
-
-        # Проверка на принадлежность к YouTube
         text_lower = text.lower()
-        if "youtube.com" in text_lower or "youtu.be" in text_lower:
-            return True
-
-        return False
+        return "youtube.com" in text_lower or "youtu.be" in text_lower
 
     def check_clipboard_on_start(self):
-        """Безопасная автоподстановка при старте."""
         try:
             clipboard_content = self.clipboard_get().strip()
-
-            if self.is_valid_youtube_link(clipboard_content):
-                self.url_entry.insert(0, clipboard_content)
-                self.status_label.configure(
-                    text="Ссылка автоматически вставлена из буфера обмена",
-                    text_color="green",
+            if (
+                self.is_valid_youtube_link(clipboard_content)
+                and self.download_rows
+            ):
+                self.download_rows[0]["entry"].insert(0, clipboard_content)
+                self.download_rows[0]["status"].configure(
+                    text="Автоподстановка", text_color="#27AE60"
                 )
         except Exception:
             pass
 
     def paste_from_clipboard(self):
-        """Безопасная вставка через контекстное меню (ПКМ)."""
         try:
             text = self.clipboard_get().strip()
-
-            # Защита от зависания при ручной вставке огромного текста
             if len(text) > 500:
-                self.status_label.configure(
-                    text="Ошибка: Слишком большой текст в буфере!",
-                    text_color="red",
-                )
                 return
-
-            self.url_entry.delete(0, "end")
-            self.url_entry.insert(0, text)
-            self.status_label.configure(
-                text="Вставлено из буфера", text_color="gray"
-            )
+            if hasattr(self, "active_entry"):
+                self.active_entry.delete(0, "end")
+                self.active_entry.insert(0, text)
         except Exception:
             pass
 
     def clear_entry(self):
-        """Очистка поля ввода."""
-        self.url_entry.delete(0, "end")
+        if hasattr(self, "active_entry"):
+            self.active_entry.delete(0, "end")
 
     def choose_path(self):
         directory = ctk.filedialog.askdirectory(initialdir=self.download_path)
@@ -174,65 +293,80 @@ class YoutubeDownloaderApp(ctk.CTk):
             self.download_path = directory
             self.path_label.configure(text=f"Папка: {directory}")
 
-    def start_download_thread(self):
-        url = self.url_entry.get().strip()
-        if not url:
-            self.status_label.configure(
-                text="Ошибка: Введите ссылку!", text_color="red"
-            )
-            return
-
+    def start_all_downloads(self):
+        """Собирает все заполненные ссылки и отправляет их в пул потоков."""
         self.download_button.configure(state="disabled")
-        self.status_label.configure(text="Анализ видео...", text_color="orange")
 
-        download_thread = threading.Thread(target=self.download_video, args=(url,))
-        download_thread.start()
+        for row in self.download_rows:
+            url = row["entry"].get().strip()
+            if not url:
+                row["status"].configure(
+                    text="Пропущено: пустая ссылка", text_color="#C0392B"
+                )
+                continue
 
-    def download_video(self, url):
+            row["status"].configure(text="В очереди...", text_color="#F39C12")
+            row["entry"].configure(state="disabled")
+            row["delete_btn"].configure(state="disabled")
+
+            # Передаем задачу в Executor (он сам распределит потоки)
+            self.executor.submit(self.download_video, url, row)
+
+        # Разблокируем общую кнопку "Скачать всё" после запуска всех процессов
+        self.after(1000, lambda: self.download_button.configure(state="normal"))
+
+    def download_video(self, url, row):
+        """Логика скачивания для отдельного потока."""
+        row["status"].configure(text="Анализ...", text_color="#F39C12")
+
+        video_format = (
+            "bestvideo+bestaudio/best" if self.ffmpeg_available else "best"
+        )
         ydl_opts = {
-            "format": "bestvideo+bestaudio/best",
+            "format": video_format,
             "outtmpl": os.path.join(self.download_path, "%(title)s.%(ext)s"),
             "merge_output_format": "mp4",
-            "progress_hooks": [self.progress_hook],
+            # Используем лямбду, чтобы передать ссылку на конкретную строку GUI
+            "progress_hooks": [lambda d: self.progress_hook(d, row)],
             "nocheckcertificate": True,
         }
 
         try:
             with YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
-            self.status_label.configure(text="Успешно скачано!", text_color="green")
-            self.progress_bar.set(1)
+            row["status"].configure(text="Готово!", text_color="#27AE60")
+            row["progress"].set(1)
         except Exception as e:
-            error_message = str(e)
-            if "ffmpeg is not installed" in error_message:
-                self.status_label.configure(
-                    text="Ошибка: Установите FFmpeg в систему!", text_color="red"
+            error_msg = str(e)
+            if "ffmpeg" in error_msg:
+                row["status"].configure(
+                    text="Ошибка: нужен FFmpeg", text_color="#C0392B"
                 )
             else:
-                self.status_label.configure(
-                    text="Ошибка скачивания. См. консоль", text_color="red"
-                )
-            print(f"Ошибка при скачивании: {e}")
+                row["status"].configure(text="Ошибка", text_color="#C0392B")
+            print(f"Ошибка скачивания: {e}")
         finally:
-            self.download_button.configure(state="normal")
+            row["entry"].configure(state="normal")
+            self.update_delete_buttons_state()
 
-    def progress_hook(self, d):
+    def progress_hook(self, d, row):
+        """Обновляет прогресс и статус конкретной строки."""
         if d["status"] == "downloading":
             downloaded = d.get("downloaded_bytes", 0)
             total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
 
             if total > 0:
                 percent = downloaded / total
-                self.progress_bar.set(percent)
+                row["progress"].set(percent)
                 speed = d.get("_speed_str", "N/A")
-                self.status_label.configure(
-                    text=f"Скачивание... Скорость: {speed}", text_color="white"
-                )
+                row["status"].configure(text=f"{speed}", text_color="#FFFFFF")
         elif d["status"] == "finished":
-            self.status_label.configure(
-                text="Склеивание аудио и видео через FFmpeg...",
-                text_color="orange",
-            )
+            if self.ffmpeg_available:
+                row["status"].configure(
+                    text="Склейка FFmpeg...", text_color="#F39C12"
+                )
+            else:
+                row["status"].configure(text="Сохранение...", text_color="#F39C12")
 
 
 if __name__ == "__main__":
