@@ -858,6 +858,7 @@ class App(ctk.CTk):
 
         self._add_row()
         self.after(200, self._paste_clipboard_on_start)
+        self.after(300, self._start_youtube_check)
 
     # ------------------------------------------------------------------
     # Инициализация сервисов
@@ -875,6 +876,38 @@ class App(ctk.CTk):
             if shutil.which("node")
             else ("Node.js: НЕ НАЙДЕН", Config.COLOR_ERR)
         )
+        # Заглушка — реальная проверка выполняется в фоне после запуска UI
+        self._youtube_status = ("YouTube: Проверка...", Config.COLOR_WARN)
+
+    def _start_youtube_check(self) -> None:
+        """Запускает проверку YouTube в фоновом потоке и обновляет метку."""
+        def _run() -> None:
+            status = self._check_youtube_access()
+            self.after(0, lambda: self._youtube_label.configure(
+                text=status[0], text_color=status[1],
+            ))
+        threading.Thread(target=_run, daemon=True).start()
+
+    @staticmethod
+    def _check_youtube_access() -> tuple[str, str]:
+        """Быстрая проверка доступа к YouTube (HEAD-запрос, таймаут 5 сек)."""
+        import urllib.request
+        import urllib.error
+        try:
+            req = urllib.request.Request(
+                "https://www.youtube.com",
+                method="HEAD",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+            return ("YouTube: Доступен", Config.COLOR_OK)
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                return ("YouTube: Доступен", Config.COLOR_OK)
+            return (f"YouTube: Ошибка сервера {e.code}", Config.COLOR_WARN)
+        except OSError:
+            return ("YouTube: Недоступен", Config.COLOR_ERR)
 
     def _init_services(self) -> None:
         self._ydl       = YdlService(ffmpeg_ok=self.ffmpeg_ok)
@@ -947,6 +980,11 @@ class App(ctk.CTk):
             bar, text=self._node_status[0],
             font=("Arial", 10, "bold"), text_color=self._node_status[1],
         ).pack(side="left", padx=15)
+        self._youtube_label = ctk.CTkLabel(
+            bar, text=self._youtube_status[0],
+            font=("Arial", 10, "bold"), text_color=self._youtube_status[1],
+        )
+        self._youtube_label.pack(side="left", padx=15)
 
         # Индикатор состояния сессий
         self._session_label = ctk.CTkLabel(
