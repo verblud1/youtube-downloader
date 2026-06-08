@@ -16,6 +16,7 @@ YouTube Downloader v2 — антибот-архитектура.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import logging
 import math
@@ -64,7 +65,7 @@ class Config:
     # yt-dlp
     YDL_RETRIES        = 10
     YDL_SOCKET_TIMEOUT = 45
-    YDL_PLAYER_CLIENTS = ["web_safari", "web", "mweb"]  # fallback-цепочка
+    YDL_PLAYER_CLIENTS = ["web_safari", "web", "ios"]  # fallback-цепочка
     AUDIO_CODEC        = "mp3"
     AUDIO_QUALITY      = "192"
     MERGE_FORMAT       = "mp4"
@@ -201,11 +202,7 @@ class TokenRefresher:
         }
         if self._cookies_path and os.path.exists(self._cookies_path):
             opts["cookiefile"] = self._cookies_path
-        else:
-            try:
-                opts["cookiesfrombrowser"] = ("firefox",)
-            except Exception:
-                pass
+        # Firefox auto-cookies removed — use explicit cookies.txt file
 
         try:
             with YoutubeDL(opts) as ydl:
@@ -448,14 +445,23 @@ class YdlService:
 
         if self.cookies_path and os.path.exists(self.cookies_path):
             opts["cookiefile"] = self.cookies_path
-        elif not self.cookies_path:
-            try:
-                opts["cookiesfrombrowser"] = ("firefox",)
-            except Exception:
-                pass
+        # Автоматическое чтение cookies из браузера отключено —
+        # используйте кнопку "Куки" в интерфейсе для загрузки cookies.txt
 
-        if shutil.which("node"):
-            opts["javascript_runtimes"] = ["node"]
+        # Ищем node: сначала явный путь, потом PATH
+        _NODE_PATHS = [
+            r"C:\Program Files\nodejs\node.exe",
+            r"C:\Program Files (x86)\nodejs\node.exe",
+        ]
+        node_bin = shutil.which("node")
+        if not node_bin:
+            for p in _NODE_PATHS:
+                if os.path.exists(p):
+                    node_bin = p
+                    break
+        if node_bin:
+            opts["js_runtimes"] = {"node": {"path": node_bin}}
+            opts["remote_components"] = {"ejs:github"}  # set, как ожидает yt-dlp
 
         return opts
 
@@ -558,7 +564,7 @@ class DownloadManager:
         self._rate      = rate
         self._refresher = refresher
         self._orchestrator = RetryOrchestrator(pool, rate)
-        self._executor  = threading.ThreadPoolExecutor(
+        self._executor  = ThreadPoolExecutor(
             max_workers=Config.SESSION_POOL_SIZE,
             thread_name_prefix="ytdl",
         )
