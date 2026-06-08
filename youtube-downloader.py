@@ -16,8 +16,8 @@ class YoutubeDownloaderApp(ctk.CTk):
         self.bg_color = "#000000"
 
         # Настройка окна
-        self.title("Multi YouTube Downloader")
-        self.geometry("650x500")  # Увеличили высоту под список ссылок
+        self.title("Multi YouTube Downloader & Extractor")
+        self.geometry("700x520")  # Немного расширили окно под новые элементы
         self.resizable(False, False)
         self.configure(fg_color=self.bg_color)
 
@@ -27,7 +27,6 @@ class YoutubeDownloaderApp(ctk.CTk):
         self.executor = ThreadPoolExecutor(max_workers=3)
 
         # Список для хранения объектов (словарей) каждого поля ввода
-        # Структура: {"frame": CTkFrame, "entry": CTkEntry, "progress": CTkProgressBar, "status": CTkLabel}
         self.download_rows = []
 
         # Инициализация интерфейса
@@ -47,7 +46,7 @@ class YoutubeDownloaderApp(ctk.CTk):
         # Заголовок
         self.title_label = ctk.CTkLabel(
             self,
-            text="Мультипоточное скачивание видео",
+            text="Мультипоточное скачивание видео и аудио",
             font=("Arial", 16, "bold"),
             text_color="#FFFFFF",
             fg_color=self.bg_color,
@@ -115,8 +114,8 @@ class YoutubeDownloaderApp(ctk.CTk):
         # ПРОКРУЧИВАЕМЫЙ ФРЕЙМ ДЛЯ СПИСКА ССЫЛОК
         self.scroll_frame = ctk.CTkScrollableFrame(
             self,
-            width=580,
-            height=220,
+            width=640,
+            height=240,
             fg_color="#050505",
             border_color="#111111",
             border_width=1,
@@ -126,7 +125,7 @@ class YoutubeDownloaderApp(ctk.CTk):
         # Кнопка СКАЧАТЬ ВСЁ
         self.download_button = ctk.CTkButton(
             self,
-            text="Скачать все видео",
+            text="Скачать всё",
             font=("Arial", 14, "bold"),
             command=self.start_all_downloads,
             fg_color="#111111",
@@ -138,21 +137,21 @@ class YoutubeDownloaderApp(ctk.CTk):
         self.download_button.pack(pady=15)
 
     def add_download_row(self):
-        """Динамически добавляет новую строку для скачивания (Поле + Прогресс-бар + Кнопка удаления)."""
+        """Динамически добавляет новую строку (Поле + Галочка аудио + Прогресс + Удаление)."""
         row_frame = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
         row_frame.pack(fill="x", pady=5)
 
-        # Контейнер для упорядочивания элементов внутри строки
-        entry_and_del = ctk.CTkFrame(row_frame, fg_color="transparent")
-        entry_and_del.pack(fill="x")
+        # Верхняя линия: Поле ввода + Чекбокс + Кнопка удаления
+        entry_and_controls = ctk.CTkFrame(row_frame, fg_color="transparent")
+        entry_and_controls.pack(fill="x")
 
         entry = ctk.CTkEntry(
-            entry_and_del,
+            entry_and_controls,
             placeholder_text="Вставьте ссылку на YouTube...",
             fg_color="#080808",
             border_color="#222222",
             text_color="#DDDDDD",
-            width=460,
+            width=430,
         )
         entry.pack(side="left", padx=(5, 5))
 
@@ -160,9 +159,26 @@ class YoutubeDownloaderApp(ctk.CTk):
         entry.bind("<Button-3>", self.show_context_menu)
         entry.bind("<Button-2>", self.show_context_menu)
 
-        # Кнопка удаления строки (доступна, только если это не единственная строка)
+        # ЧЕКБОКС: Скачать только звук
+        audio_only_var = tk.BooleanVar(value=False)
+        audio_checkbox = ctk.CTkCheckBox(
+            entry_and_controls,
+            text="Только звук",
+            variable=audio_only_var,
+            font=("Arial", 11),
+            width=90,
+            checkbox_width=16,
+            checkbox_height=16,
+            border_width=1,
+            fg_color="#333333",
+            hover_color="#555555",
+            text_color="#BBBBBB",
+        )
+        audio_checkbox.pack(side="left", padx=5)
+
+        # Кнопка удаления строки
         delete_btn = ctk.CTkButton(
-            entry_and_del,
+            entry_and_controls,
             text="✕",
             width=30,
             height=28,
@@ -172,7 +188,7 @@ class YoutubeDownloaderApp(ctk.CTk):
         )
         delete_btn.pack(side="right", padx=5)
 
-        # Индикатор прогресса и статус для конкретной строки
+        # Нижняя линия: Индикатор прогресса и текстовый статус
         status_bar_frame = ctk.CTkFrame(row_frame, fg_color="transparent")
         status_bar_frame.pack(fill="x", pady=(2, 5))
 
@@ -190,28 +206,27 @@ class YoutubeDownloaderApp(ctk.CTk):
         )
         status.pack(side="left", padx=10)
 
-        # Сохраняем все ссылки на виджеты строки в словарь
+        # Сохраняем ссылки на виджеты строки в общий список
         row_dict = {
             "frame": row_frame,
             "entry": entry,
+            "audio_only_var": audio_only_var,
+            "checkbox": audio_checkbox,
             "progress": progress,
             "status": status,
             "delete_btn": delete_btn,
         }
         self.download_rows.append(row_dict)
 
-        # Если строка стала больше одной, включаем кнопки удаления у остальных
         self.update_delete_buttons_state()
 
     def remove_download_row(self, row_dict):
-        """Удаляет строку из интерфейса и из списка."""
         if len(self.download_rows) > 1:
             row_dict["frame"].destroy()
             self.download_rows.remove(row_dict)
             self.update_delete_buttons_state()
 
     def update_delete_buttons_state(self):
-        """Блокирует кнопку удаления, если осталась всего одна строка."""
         state = "normal" if len(self.download_rows) > 1 else "disabled"
         for row in self.download_rows:
             row["delete_btn"].configure(state=state)
@@ -222,7 +237,8 @@ class YoutubeDownloaderApp(ctk.CTk):
             self.ffmpeg_available = True
         else:
             self.ffmpeg_label.configure(
-                text="FFmpeg: НЕ НАЙДЕН (Качество 720p)", text_color="#C0392B"
+                text="FFmpeg: НЕ НАЙДЕН (Качество/Звук ограничены)",
+                text_color="#C0392B",
             )
             self.ffmpeg_available = False
 
@@ -248,7 +264,7 @@ class YoutubeDownloaderApp(ctk.CTk):
         self.context_menu.add_command(label="Очистить", command=self.clear_entry)
 
     def show_context_menu(self, event):
-        self.active_entry = event.widget  # Запоминаем, на каком поле кликнули
+        self.active_entry = event.widget
         self.active_entry.focus()
         self.context_menu.tk_popup(event.x_root, event.y_root)
 
@@ -294,7 +310,6 @@ class YoutubeDownloaderApp(ctk.CTk):
             self.path_label.configure(text=f"Папка: {directory}")
 
     def start_all_downloads(self):
-        """Собирает все заполненные ссылки и отправляет их в пул потоков."""
         self.download_button.configure(state="disabled")
 
         for row in self.download_rows:
@@ -307,29 +322,44 @@ class YoutubeDownloaderApp(ctk.CTk):
 
             row["status"].configure(text="В очереди...", text_color="#F39C12")
             row["entry"].configure(state="disabled")
+            row["checkbox"].configure(state="disabled")
             row["delete_btn"].configure(state="disabled")
 
-            # Передаем задачу в Executor (он сам распределит потоки)
+            # Передаем управление в пул потоков
             self.executor.submit(self.download_video, url, row)
 
-        # Разблокируем общую кнопку "Скачать всё" после запуска всех процессов
         self.after(1000, lambda: self.download_button.configure(state="normal"))
 
     def download_video(self, url, row):
-        """Логика скачивания для отдельного потока."""
+        audio_only = row["audio_only_var"].get()
         row["status"].configure(text="Анализ...", text_color="#F39C12")
 
-        video_format = (
-            "bestvideo+bestaudio/best" if self.ffmpeg_available else "best"
-        )
+        # Базовые опции yt-dlp
         ydl_opts = {
-            "format": video_format,
             "outtmpl": os.path.join(self.download_path, "%(title)s.%(ext)s"),
-            "merge_output_format": "mp4",
-            # Используем лямбду, чтобы передать ссылку на конкретную строку GUI
             "progress_hooks": [lambda d: self.progress_hook(d, row)],
             "nocheckcertificate": True,
         }
+
+        # МЕХАНИКА: Разделение логики Видео / Аудио
+        if audio_only:
+            # Скачиваем только аудиодорожку
+            ydl_opts["format"] = "bestaudio/best"
+            if self.ffmpeg_available:
+                # Если FFmpeg есть, извлекаем аудио и конвертируем в чистый mp3
+                ydl_opts["postprocessors"] = [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }
+                ]
+        else:
+            # Скачиваем полноценное видео
+            ydl_opts["format"] = (
+                "bestvideo+bestaudio/best" if self.ffmpeg_available else "best"
+            )
+            ydl_opts["merge_output_format"] = "mp4"
 
         try:
             with YoutubeDL(ydl_opts) as ydl:
@@ -337,20 +367,14 @@ class YoutubeDownloaderApp(ctk.CTk):
             row["status"].configure(text="Готово!", text_color="#27AE60")
             row["progress"].set(1)
         except Exception as e:
-            error_msg = str(e)
-            if "ffmpeg" in error_msg:
-                row["status"].configure(
-                    text="Ошибка: нужен FFmpeg", text_color="#C0392B"
-                )
-            else:
-                row["status"].configure(text="Ошибка", text_color="#C0392B")
+            row["status"].configure(text="Ошибка", text_color="#C0392B")
             print(f"Ошибка скачивания: {e}")
         finally:
             row["entry"].configure(state="normal")
+            row["checkbox"].configure(state="normal")
             self.update_delete_buttons_state()
 
     def progress_hook(self, d, row):
-        """Обновляет прогресс и статус конкретной строки."""
         if d["status"] == "downloading":
             downloaded = d.get("downloaded_bytes", 0)
             total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
@@ -361,10 +385,14 @@ class YoutubeDownloaderApp(ctk.CTk):
                 speed = d.get("_speed_str", "N/A")
                 row["status"].configure(text=f"{speed}", text_color="#FFFFFF")
         elif d["status"] == "finished":
+            audio_only = row["audio_only_var"].get()
             if self.ffmpeg_available:
-                row["status"].configure(
-                    text="Склейка FFmpeg...", text_color="#F39C12"
+                status_text = (
+                    "Конвертация в MP3..."
+                    if audio_only
+                    else "Склейка FFmpeg..."
                 )
+                row["status"].configure(text=status_text, text_color="#F39C12")
             else:
                 row["status"].configure(text="Сохранение...", text_color="#F39C12")
 
