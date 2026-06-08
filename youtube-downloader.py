@@ -1,538 +1,808 @@
+"""
+Multi YouTube Downloader — рефакторированная версия.
+
+Архитектура:
+  config.py        → константы и настройки (здесь: класс Config)
+  DownloadRow      → dataclass вместо god-object dict
+  YdlService       → вся логика yt-dlp (build_opts, fetch_info, download)
+  DownloadManager  → очередь задач, ThreadPoolExecutor
+  PlaylistWindow   → модальное окно выбора треков
+  App              → только GUI-слой, делегирует всё выше
+"""
+
+from __future__ import annotations
+
+import logging
 import os
 import shutil
-import tkinter as tk
-from concurrent.futures import ThreadPoolExecutor
 import threading
+import tkinter as tk
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Callable
+
 import customtkinter as ctk
 from yt_dlp import YoutubeDL
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("ytdl")
 
 ctk.set_appearance_mode("Dark")
 
 
+# ---------------------------------------------------------------------------
+# Config — все магические значения в одном месте
+# ---------------------------------------------------------------------------
+class Config:
+    WINDOW_TITLE = "Multi YouTube Downloader Ultra Pro"
+    WINDOW_SIZE = "860x560"
+
+    THREAD_WORKERS = 3
+    YDL_RETRIES = 15
+    YDL_SOCKET_TIMEOUT = 45
+    YDL_PLAYER_CLIENT = ["web_safari"]
+    AUDIO_CODEC = "mp3"
+    AUDIO_QUALITY = "192"
+    MERGE_FORMAT = "mp4"
+
+    ENTRY_MAX_LEN = 250
+    PLAYLIST_TITLE_MAX_LEN = 60
+
+    COLOR_OK = "#27AE60"
+    COLOR_WARN = "#F39C12"
+    COLOR_ERR = "#C0392B"
+    COLOR_MUTED = "#888888"
+    COLOR_WHITE = "#FFFFFF"
+    COLOR_BG = "#000000"
+    COLOR_SURFACE = "#050505"
+    COLOR_BORDER = "#222222"
+    COLOR_BTN = "#111111"
+    COLOR_BTN_HOVER = "#1A1A1A"
+    COLOR_DELETE = "#C0392B"
+    COLOR_DELETE_HOVER = "#A93226"
+    COLOR_ADD = "#27AE60"
+    COLOR_ADD_HOVER = "#219653"
+
+
+# ---------------------------------------------------------------------------
+# DownloadRow — типизированный объект строки загрузки
+# ---------------------------------------------------------------------------
+@dataclass
+class DownloadRow:
+    """Хранит все виджеты и состояние одной строки загрузки."""
+
+    frame: ctk.CTkFrame
+    entry: ctk.CTkEntry
+    quality_menu: ctk.CTkOptionMenu
+    audio_only_var: tk.BooleanVar
+    checkbox: ctk.CTkCheckBox
+    progress: ctk.CTkProgressBar
+    status: ctk.CTkLabel
+    delete_btn: ctk.CTkButton
+    last_url: str = ""
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+    # --- Удобные методы обновления GUI (вызывать из любого потока через after) ---
+
+    def set_status(self, text: str, color: str = Config.COLOR_MUTED) -> None:
+        self.status.configure(text=text, text_color=color)
+
+    def set_progress(self, value: float) -> None:
+        self.progress.set(value)
+
+    def lock(self) -> None:
+        """Заблокировать виджеты строки на время загрузки."""
+        self.entry.configure(state="disabled")
+        self.checkbox.configure(state="disabled")
+        self.quality_menu.configure(state="disabled")
+        self.delete_btn.configure(state="disabled")
+
+    def unlock(self, ffmpeg_ok: bool) -> None:
+        """Разблокировать виджеты после завершения."""
+        self.entry.configure(state="normal")
+        self.checkbox.configure(state="normal")
+        self.delete_btn.configure(state="normal")
+        # quality_menu разблокируем только если не аудио-режим и есть форматы
+        if not self.audio_only_var.get() and len(self.quality_menu.cget("values")) > 1:
+            self.quality_menu.configure(state="normal")
+
+    def reset_cancel(self) -> None:
+        self.cancel_event.clear()
+
+    @property
+    def url(self) -> str:
+        return self.entry.get().strip()
+
+    @property
+    def audio_only(self) -> bool:
+        return self.audio_only_var.get()
+
+    @property
+    def selected_quality(self) -> str:
+        return self.quality_menu.get()
+
+
+# ---------------------------------------------------------------------------
+# YdlService — вся логика yt-dlp, без GUI
+# ---------------------------------------------------------------------------
+class YdlService:
+    """Сервис-обёртка над yt-dlp. Не знает ничего о GUI."""
+
+    def __init__(self, cookies_path: str | None = None, ffmpeg_ok: bool = True) -> None:
+        self.cookies_path = cookies_path
+        self.ffmpeg_ok = ffmpeg_ok
+
+    # --- Общая база опций ---
+
+    def _base_opts(self) -> dict:
+        opts: dict = {
+            "nocheckcertificate": True,
+            "quiet": True,
+            "extractor_args": {"youtube": {"player_client": Config.YDL_PLAYER_CLIENT}},
+        }
+        if self.cookies_path and os.path.exists(self.cookies_path):
+            opts["cookiefile"] = self.cookies_path
+        if shutil.which("node"):
+            opts["javascript_runtimes"] = ["node"]
+        return opts
+
+    def _apply_browser_cookies(self, opts: dict) -> dict:
+        """Добавляет куки из браузера, если не задан файл вручную."""
+        if not self.cookies_path:
+            try:
+                opts["cookiesfrombrowser"] = ("firefox",)
+            except Exception:
+                opts.pop("cookiesfrombrowser", None)
+        return opts
+
+    # --- Публичные методы ---
+
+    def fetch_playlist_entries(self, url: str) -> list[dict]:
+        """Возвращает плоский список треков плейлиста без загрузки медиа."""
+        opts = {**self._base_opts(), "extract_flat": True, "skip_download": True, "ignoreerrors": True}
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        return info.get("entries", []) if info else []
+
+    def fetch_resolutions(self, url: str) -> list[str]:
+        """Возвращает список доступных высот видео (например ['1080', '720', ...])."""
+        opts = self._base_opts()
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if not info:
+            return []
+        heights: set[int] = set()
+        for fmt in info.get("formats", []):
+            if fmt.get("vcodec") != "none" and fmt.get("height"):
+                heights.add(fmt["height"])
+        return [str(h) for h in sorted(heights, reverse=True)]
+
+    def build_download_opts(
+        self,
+        output_dir: str,
+        audio_only: bool,
+        selected_quality: str,
+        progress_hook: Callable,
+        cancel_event: threading.Event,
+    ) -> dict:
+        """Собирает полный набор опций для загрузки."""
+        opts = {
+            **self._base_opts(),
+            "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
+            "progress_hooks": [progress_hook],
+            "retries": Config.YDL_RETRIES,
+            "fragment_retries": Config.YDL_RETRIES,
+            "socket_timeout": Config.YDL_SOCKET_TIMEOUT,
+            "ignoreerrors": True,
+        }
+        opts = self._apply_browser_cookies(opts)
+        opts = self._apply_format(opts, audio_only, selected_quality)
+        return opts
+
+    def _apply_format(self, opts: dict, audio_only: bool, quality: str) -> dict:
+        if audio_only:
+            opts["format"] = "bestaudio/best"
+            if self.ffmpeg_ok:
+                opts["postprocessors"] = [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": Config.AUDIO_CODEC,
+                    "preferredquality": Config.AUDIO_QUALITY,
+                }]
+        else:
+            if quality == "Максимальное" or not self.ffmpeg_ok:
+                opts["format"] = "bestvideo+bestaudio/best" if self.ffmpeg_ok else "best"
+            else:
+                opts["format"] = f"bestvideo[height<={quality}]+bestaudio/best"
+            opts["merge_output_format"] = Config.MERGE_FORMAT
+        return opts
+
+    def download(self, url: str, ydl_opts: dict) -> bool:
+        """Запускает загрузку. Возвращает True при успехе."""
+        with YoutubeDL(ydl_opts) as ydl:
+            result = ydl.download([url])
+        return result == 0
+
+
+# ---------------------------------------------------------------------------
+# DownloadManager — управляет очередью и пулом потоков
+# ---------------------------------------------------------------------------
+class DownloadManager:
+    """Запускает задачи загрузки в ThreadPoolExecutor."""
+
+    def __init__(self, workers: int = Config.THREAD_WORKERS) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=workers)
+        self._futures: list[Future] = []
+
+    def submit(self, fn: Callable, *args) -> Future:
+        future = self._executor.submit(fn, *args)
+        self._futures.append(future)
+        return future
+
+    def shutdown(self) -> None:
+        self._executor.shutdown(wait=False)
+
+
+# ---------------------------------------------------------------------------
+# PlaylistWindow — модальное окно выбора треков
+# ---------------------------------------------------------------------------
 class PlaylistWindow(ctk.CTkToplevel):
-    """Модальное окно для выбора видеороликов из найденного плейлиста."""
-    def __init__(self, parent, entries, callback):
+
+    def __init__(
+        self,
+        parent: ctk.CTk,
+        entries: list[dict],
+        callback: Callable[[list[str]], None],
+    ) -> None:
         super().__init__(parent)
-        
         self.title("Выбор треков из плейлиста")
         self.geometry("550x450")
         self.resizable(False, False)
-        self.configure(fg_color="#000000")
-        
-        # Делаем окно модальным
+        self.configure(fg_color=Config.COLOR_BG)
         self.transient(parent)
         self.grab_set()
-        
+
         self.entries = entries
         self.callback = callback
-        self.checkbox_vars = []
-        
-        self.create_widgets()
+        self.checkbox_vars: list[tk.BooleanVar] = []
 
-    def create_widgets(self):
-        # Заголовок окна
-        title = ctk.CTkLabel(
-            self, 
-            text=f"Обнаружен плейлист ({len(self.entries)} видео)\nОтметьте файлы, которые хотите скачать:", 
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        ctk.CTkLabel(
+            self,
+            text=(
+                f"Обнаружен плейлист ({len(self.entries)} видео)\n"
+                "Отметьте файлы, которые хотите скачать:"
+            ),
             font=("Arial", 13, "bold"),
-            text_color="#FFFFFF"
-        )
-        title.pack(pady=15)
+            text_color=Config.COLOR_WHITE,
+        ).pack(pady=15)
 
-        # Панель быстрых действий
         action_frame = ctk.CTkFrame(self, fg_color="transparent")
         action_frame.pack(fill="x", padx=25, pady=(0, 10))
 
-        select_all_btn = ctk.CTkButton(
-            action_frame, text="Выбрать все", width=100, height=24,
-            fg_color="#111111", hover_color="#222222", text_color="#FFFFFF",
-            border_color="#333333", border_width=1, command=self.select_all
-        )
-        select_all_btn.pack(side="left", padx=5)
+        for text, cmd in [("Выбрать все", self._select_all), ("Снять все", self._deselect_all)]:
+            ctk.CTkButton(
+                action_frame, text=text, width=100, height=24,
+                fg_color=Config.COLOR_BTN, hover_color="#222222",
+                text_color=Config.COLOR_WHITE,
+                border_color="#333333", border_width=1,
+                command=cmd,
+            ).pack(side="left", padx=5)
 
-        deselect_all_btn = ctk.CTkButton(
-            action_frame, text="Снять все", width=100, height=24,
-            fg_color="#111111", hover_color="#222222", text_color="#FFFFFF",
-            border_color="#333333", border_width=1, command=self.deselect_all
+        scroll = ctk.CTkScrollableFrame(
+            self, width=480, height=260,
+            fg_color=Config.COLOR_SURFACE,
+            border_color="#111111", border_width=1,
         )
-        deselect_all_btn.pack(side="left", padx=5)
+        scroll.pack(padx=25, pady=5)
 
-        # Скролл-зона для чекбоксов
-        self.scroll_frame = ctk.CTkScrollableFrame(
-            self, width=480, height=260, fg_color="#050505", 
-            border_color="#111111", border_width=1
-        )
-        self.scroll_frame.pack(padx=25, pady=5)
-
-        # Заполнение списка видео
         for idx, entry in enumerate(self.entries):
-            var = tk.BooleanVar(value=True)  # По умолчанию выбраны все
+            var = tk.BooleanVar(value=True)
             self.checkbox_vars.append(var)
-            
-            # Ограничиваем длину названия для GUI
             raw_title = entry.get("title") or f"Видео #{idx + 1}"
-            display_title = raw_title if len(raw_title) < 60 else raw_title[:57] + "..."
-            
-            cb = ctk.CTkCheckBox(
-                self.scroll_frame, text=display_title, variable=var,
-                font=("Arial", 11), checkbox_width=16, checkbox_height=16,
-                fg_color="#27AE60", hover_color="#219653", text_color="#DDDDDD"
+            display = (
+                raw_title
+                if len(raw_title) < Config.PLAYLIST_TITLE_MAX_LEN
+                else raw_title[: Config.PLAYLIST_TITLE_MAX_LEN - 3] + "..."
             )
-            cb.pack(anchor="w", pady=4, padx=5)
+            ctk.CTkCheckBox(
+                scroll, text=display, variable=var,
+                font=("Arial", 11), checkbox_width=16, checkbox_height=16,
+                fg_color=Config.COLOR_OK, hover_color=Config.COLOR_ADD_HOVER,
+                text_color="#DDDDDD",
+            ).pack(anchor="w", pady=4, padx=5)
 
-        # Кнопка подтверждения
-        confirm_btn = ctk.CTkButton(
-            self, text="Добавить выбранные в очередь", font=("Arial", 13, "bold"),
-            fg_color="#27AE60", hover_color="#219653", text_color="#FFFFFF",
-            height=35, command=self.confirm_selection
-        )
-        confirm_btn.pack(pady=15)
+        ctk.CTkButton(
+            self,
+            text="Добавить выбранные в очередь",
+            font=("Arial", 13, "bold"),
+            fg_color=Config.COLOR_OK, hover_color=Config.COLOR_ADD_HOVER,
+            text_color=Config.COLOR_WHITE, height=35,
+            command=self._confirm,
+        ).pack(pady=15)
 
-    def select_all(self):
+    def _select_all(self) -> None:
         for var in self.checkbox_vars:
             var.set(True)
 
-    def deselect_all(self):
+    def _deselect_all(self) -> None:
         for var in self.checkbox_vars:
             var.set(False)
 
-    def confirm_selection(self):
-        # Фильтруем ссылки, оставляя только выбранные пользователем
-        selected_urls = []
+    def _confirm(self) -> None:
+        selected: list[str] = []
         for idx, entry in enumerate(self.entries):
-            if self.checkbox_vars[idx].get():
-                url = entry.get("url") or entry.get("webpage_url")
-                if url:
-                    # Корректируем относительные ссылки, если yt-dlp отдал только ID
-                    if not url.startswith("http"):
-                        url = f"https://www.youtube.com/watch?v={url}"
-                    selected_urls.append(url)
-        
-        # Передаем массив в главный поток через callback и закрываем окно
-        self.callback(selected_urls)
+            if not self.checkbox_vars[idx].get():
+                continue
+            url = entry.get("url") or entry.get("webpage_url") or ""
+            if url and not url.startswith("http"):
+                url = f"https://www.youtube.com/watch?v={url}"
+            if url:
+                selected.append(url)
+        self.callback(selected)
         self.destroy()
 
 
-class YoutubeDownloaderApp(ctk.CTk):
+# ---------------------------------------------------------------------------
+# App — GUI-слой, делегирует бизнес-логику сервисам
+# ---------------------------------------------------------------------------
+class App(ctk.CTk):
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-
-        self.bg_color = "#000000"
-
-        # Настройка главного окна
-        self.title("Multi YouTube Downloader Ultra Pro")
-        self.geometry("860x540")
+        self.configure(fg_color=Config.COLOR_BG)
+        self.title(Config.WINDOW_TITLE)
+        self.geometry(Config.WINDOW_SIZE)
         self.resizable(False, False)
-        self.configure(fg_color=self.bg_color)
 
         self.download_path = os.path.join(os.path.expanduser("~"), "Downloads")
-        self.manual_cookies_path = None
-        
-        self.executor = ThreadPoolExecutor(max_workers=3)
-        self.download_rows = []
+        self.ffmpeg_ok: bool = False
+        self.rows: list[DownloadRow] = []
 
-        self.create_widgets()
-        self.create_context_menu()
-        self.check_system_dependencies()
+        # Зависимости
+        self._check_deps()
+        self._ydl = YdlService(ffmpeg_ok=self.ffmpeg_ok)
+        self._manager = DownloadManager()
 
-        self.add_download_row()
-        self.after(200, self.check_clipboard_on_start)
+        self._build_ui()
+        self._create_context_menu()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def create_widgets(self):
-        self.title_label = ctk.CTkLabel(
-            self, text="Мультипоточное скачивание видео, аудио и плейлистов",
-            font=("Arial", 16, "bold"), text_color="#FFFFFF", fg_color=self.bg_color,
-        )
-        self.title_label.pack(pady=15)
+        self._add_row()
+        self.after(200, self._paste_clipboard_on_start)
 
-        # Панель управления
-        self.control_frame = ctk.CTkFrame(self, fg_color=self.bg_color)
-        self.control_frame.pack(pady=5, fill="x", padx=30)
+    # ------------------------------------------------------------------
+    # Системные зависимости
+    # ------------------------------------------------------------------
 
-        self.path_label = ctk.CTkLabel(
-            self.control_frame, text=f"Папка: {self.download_path}",
+    def _check_deps(self) -> None:
+        if shutil.which("ffmpeg"):
+            self.ffmpeg_ok = True
+            self._ffmpeg_status = ("FFmpeg: ОК", Config.COLOR_OK)
+        else:
+            self.ffmpeg_ok = False
+            self._ffmpeg_status = ("FFmpeg: НЕ НАЙДЕН (ограничение 720p/Аудио)", Config.COLOR_ERR)
+
+        if shutil.which("node"):
+            self._node_status = ("Node.js: ОК", Config.COLOR_OK)
+        else:
+            self._node_status = ("Node.js: НЕ НАЙДЕН", Config.COLOR_ERR)
+
+    # ------------------------------------------------------------------
+    # Построение интерфейса
+    # ------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        ctk.CTkLabel(
+            self,
+            text="Мультипоточное скачивание видео, аудио и плейлистов",
+            font=("Arial", 16, "bold"),
+            text_color=Config.COLOR_WHITE,
+            fg_color=Config.COLOR_BG,
+        ).pack(pady=15)
+
+        self._build_control_bar()
+        self._build_deps_bar()
+        self._build_scroll_area()
+        self._build_action_bar()
+
+    def _build_control_bar(self) -> None:
+        bar = ctk.CTkFrame(self, fg_color=Config.COLOR_BG)
+        bar.pack(pady=5, fill="x", padx=30)
+
+        self._path_label = ctk.CTkLabel(
+            bar, text=f"Папка: {self.download_path}",
             font=("Arial", 11), text_color="#BBBBBB",
         )
-        self.path_label.pack(side="left", padx=5)
+        self._path_label.pack(side="left", padx=5)
 
-        self.path_button = ctk.CTkButton(
-            self.control_frame, text="Изменить папку", width=110, height=28,
-            command=self.choose_path, fg_color="#111111", hover_color="#1A1A1A",
-            text_color="#FFFFFF", border_color="#333333", border_width=1,
+        for text, cmd, color, tc in [
+            ("Изменить папку", self._choose_path, Config.COLOR_BTN, Config.COLOR_WHITE),
+            ("Куки (.txt)",    self._choose_cookies, Config.COLOR_BTN, Config.COLOR_WARN),
+            ("+ Добавить ссылку", self._add_row, Config.COLOR_ADD, Config.COLOR_WHITE),
+        ]:
+            ctk.CTkButton(
+                bar, text=text, width=130, height=28,
+                command=cmd, fg_color=color,
+                hover_color=Config.COLOR_BTN_HOVER if color == Config.COLOR_BTN else Config.COLOR_ADD_HOVER,
+                text_color=tc,
+                border_color="#333333", border_width=1,
+            ).pack(side="right", padx=5)
+
+    def _build_deps_bar(self) -> None:
+        bar = ctk.CTkFrame(self, fg_color=Config.COLOR_BG)
+        bar.pack(pady=5)
+
+        self._ffmpeg_label = ctk.CTkLabel(
+            bar, text=self._ffmpeg_status[0],
+            font=("Arial", 10, "bold"), text_color=self._ffmpeg_status[1],
         )
-        self.path_button.pack(side="right", padx=5)
+        self._ffmpeg_label.pack(side="left", padx=15)
 
-        self.cookies_button = ctk.CTkButton(
-            self.control_frame, text="Куки (.txt)", width=90, height=28,
-            command=self.choose_cookies_file, fg_color="#111111", hover_color="#1A1A1A",
-            text_color="#F39C12", border_color="#333333", border_width=1,
+        self._node_label = ctk.CTkLabel(
+            bar, text=self._node_status[0],
+            font=("Arial", 10, "bold"), text_color=self._node_status[1],
         )
-        self.cookies_button.pack(side="right", padx=5)
+        self._node_label.pack(side="left", padx=15)
 
-        self.add_button = ctk.CTkButton(
-            self.control_frame, text="+ Добавить ссылку", width=130, height=28,
-            command=self.add_download_row, fg_color="#27AE60", hover_color="#219653",
-            text_color="#FFFFFF",
+    def _build_scroll_area(self) -> None:
+        self._scroll = ctk.CTkScrollableFrame(
+            self, width=800, height=240,
+            fg_color=Config.COLOR_SURFACE,
+            border_color="#111111", border_width=1,
         )
-        self.add_button.pack(side="right", padx=5)
+        self._scroll.pack(pady=10, padx=20)
 
-        # Панель системных зависимостей
-        self.deps_frame = ctk.CTkFrame(self, fg_color=self.bg_color)
-        self.deps_frame.pack(pady=5)
-
-        self.ffmpeg_label = ctk.CTkLabel(
-            self.deps_frame, text="FFmpeg: Проверка...", font=("Arial", 10, "bold"), text_color="#F39C12"
+    def _build_action_bar(self) -> None:
+        self._dl_button = ctk.CTkButton(
+            self, text="Скачать все файлы",
+            font=("Arial", 14, "bold"),
+            command=self._start_all,
+            fg_color=Config.COLOR_BTN,
+            hover_color=Config.COLOR_BTN_HOVER,
+            text_color=Config.COLOR_WHITE,
+            border_color="#333333", border_width=1,
         )
-        self.ffmpeg_label.pack(side="left", padx=15)
+        self._dl_button.pack(pady=15)
 
-        self.nodejs_label = ctk.CTkLabel(
-            self.deps_frame, text="Node.js: Проверка...", font=("Arial", 10, "bold"), text_color="#F39C12"
-        )
-        self.nodejs_label.pack(side="left", padx=15)
+    # ------------------------------------------------------------------
+    # Управление строками
+    # ------------------------------------------------------------------
 
-        # Главный прокручиваемый список ссылок
-        self.scroll_frame = ctk.CTkScrollableFrame(
-            self, width=800, height=240, fg_color="#050505", border_color="#111111", border_width=1
-        )
-        self.scroll_frame.pack(pady=10, padx=20)
-
-        # Кнопка запуска
-        self.download_button = ctk.CTkButton(
-            self, text="Скачать все файлы", font=("Arial", 14, "bold"),
-            command=self.start_all_downloads, fg_color="#111111", hover_color="#1A1A1A",
-            text_color="#FFFFFF", border_color="#333333", border_width=1,
-        )
-        self.download_button.pack(pady=15)
-
-    def add_download_row(self):
-        row_frame = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
+    def _add_row(self) -> None:
+        row_frame = ctk.CTkFrame(self._scroll, fg_color="transparent")
         row_frame.pack(fill="x", pady=5)
 
-        entry_and_controls = ctk.CTkFrame(row_frame, fg_color="transparent")
-        entry_and_controls.pack(fill="x")
+        controls = ctk.CTkFrame(row_frame, fg_color="transparent")
+        controls.pack(fill="x")
 
         entry = ctk.CTkEntry(
-            entry_and_controls, placeholder_text="Вставьте ссылку на видео или плейлист...",
-            fg_color="#080808", border_color="#222222", text_color="#DDDDDD", width=420,
+            controls,
+            placeholder_text="Вставьте ссылку на видео или плейлист...",
+            fg_color="#080808", border_color=Config.COLOR_BORDER,
+            text_color="#DDDDDD", width=420,
         )
         entry.pack(side="left", padx=5)
 
-        entry.bind("<KeyRelease>", lambda event: self.on_link_changed(row_dict))
-        entry.bind("<Button-3>", self.show_context_menu)
-        entry.bind("<Button-2>", self.show_context_menu)
-
         quality_menu = ctk.CTkOptionMenu(
-            entry_and_controls, values=["Максимальное"], width=130, height=28,
-            fg_color="#111111", button_color="#222222", button_hover_color="#333333", state="disabled",
+            controls, values=["Максимальное"], width=130, height=28,
+            fg_color=Config.COLOR_BTN, button_color="#222222",
+            button_hover_color="#333333", state="disabled",
         )
         quality_menu.pack(side="left", padx=5)
 
-        audio_only_var = tk.BooleanVar(value=False)
-        audio_checkbox = ctk.CTkCheckBox(
-            entry_and_controls, text="Только звук", variable=audio_only_var,
-            font=("Arial", 11), width=90, checkbox_width=16, checkbox_height=16,
-            border_width=1, fg_color="#333333", hover_color="#555555", text_color="#BBBBBB",
-            command=lambda: self.toggle_audio_mode(row_dict),
+        audio_var = tk.BooleanVar(value=False)
+        checkbox = ctk.CTkCheckBox(
+            controls, text="Только звук", variable=audio_var,
+            font=("Arial", 11), width=90,
+            checkbox_width=16, checkbox_height=16, border_width=1,
+            fg_color="#333333", hover_color="#555555", text_color="#BBBBBB",
         )
-        audio_checkbox.pack(side="left", padx=5)
+        checkbox.pack(side="left", padx=5)
 
         delete_btn = ctk.CTkButton(
-            entry_and_controls, text="✕", width=30, height=28, fg_color="#C0392B", hover_color="#A93226",
-            command=lambda: self.remove_download_row(row_dict),
+            controls, text="✕", width=30, height=28,
+            fg_color=Config.COLOR_DELETE, hover_color=Config.COLOR_DELETE_HOVER,
         )
         delete_btn.pack(side="right", padx=5)
 
-        status_bar_frame = ctk.CTkFrame(row_frame, fg_color="transparent")
-        status_bar_frame.pack(fill="x", pady=(2, 5))
+        status_bar = ctk.CTkFrame(row_frame, fg_color="transparent")
+        status_bar.pack(fill="x", pady=(2, 5))
 
-        progress = ctk.CTkProgressBar(status_bar_frame, width=320, progress_color="#FFFFFF", fg_color="#0F0F0F")
+        progress = ctk.CTkProgressBar(
+            status_bar, width=320, progress_color=Config.COLOR_WHITE, fg_color="#0F0F0F",
+        )
         progress.set(0)
         progress.pack(side="left", padx=5)
 
-        status = ctk.CTkLabel(status_bar_frame, text="Ожидание ссылки", font=("Arial", 10), text_color="#888888")
+        status = ctk.CTkLabel(
+            status_bar, text="Ожидание ссылки",
+            font=("Arial", 10), text_color=Config.COLOR_MUTED,
+        )
         status.pack(side="left", padx=10)
 
-        row_dict = {
-            "frame": row_frame,
-            "entry": entry,
-            "quality_menu": quality_menu,
-            "audio_only_var": audio_only_var,
-            "checkbox": audio_checkbox,
-            "progress": progress,
-            "status": status,
-            "delete_btn": delete_btn,
-            "last_url": "",
-        }
-        self.download_rows.append(row_dict)
-        self.update_delete_buttons_state()
+        row = DownloadRow(
+            frame=row_frame, entry=entry, quality_menu=quality_menu,
+            audio_only_var=audio_var, checkbox=checkbox,
+            progress=progress, status=status, delete_btn=delete_btn,
+        )
 
-    def toggle_audio_mode(self, row_dict):
-        if row_dict["audio_only_var"].get():
-            row_dict["quality_menu"].configure(state="disabled")
+        # Привязки после создания row
+        entry.bind("<KeyRelease>", lambda _e: self._on_link_changed(row))
+        entry.bind("<Button-3>", self._show_context_menu)
+        entry.bind("<Button-2>", self._show_context_menu)
+        checkbox.configure(command=lambda: self._toggle_audio_mode(row))
+        delete_btn.configure(command=lambda: self._remove_row(row))
+
+        self.rows.append(row)
+        self._refresh_delete_states()
+
+    def _remove_row(self, row: DownloadRow) -> None:
+        if len(self.rows) > 1:
+            row.cancel_event.set()
+            row.frame.destroy()
+            self.rows.remove(row)
+            self._refresh_delete_states()
+
+    def _refresh_delete_states(self) -> None:
+        state = "normal" if len(self.rows) > 1 else "disabled"
+        for row in self.rows:
+            row.delete_btn.configure(state=state)
+
+    def _toggle_audio_mode(self, row: DownloadRow) -> None:
+        if row.audio_only:
+            row.quality_menu.configure(state="disabled")
         else:
-            if len(row_dict["quality_menu"].cget("values")) > 1:
-                row_dict["quality_menu"].configure(state="normal")
+            if len(row.quality_menu.cget("values")) > 1:
+                row.quality_menu.configure(state="normal")
 
-    def is_playlist(self, url):
+    # ------------------------------------------------------------------
+    # Обработка ссылок
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_youtube(text: str) -> bool:
+        if not text or len(text) > Config.ENTRY_MAX_LEN or "\n" in text or "\r" in text:
+            return False
+        low = text.lower()
+        return "youtube.com" in low or "youtu.be" in low
+
+    @staticmethod
+    def _is_playlist(url: str) -> bool:
         return "list=" in url.lower()
 
-    def on_link_changed(self, row_dict):
-        url = row_dict["entry"].get().strip()
-        if url == row_dict["last_url"]:
+    def _on_link_changed(self, row: DownloadRow) -> None:
+        url = row.url
+        if url == row.last_url:
             return
+        if not self._is_youtube(url):
+            return
+        row.last_url = url
+        row.reset_cancel()
 
-        if self.is_valid_youtube_link(url):
-            row_dict["last_url"] = url
-            
-            # РАЗВЕТВЛЕНИЕ: Плейлист или одиночное Видео
-            if self.is_playlist(url):
-                row_dict["status"].configure(text="Обнаружен плейлист. Чтение структуры...", text_color="#F39C12")
-                threading.Thread(target=self.fetch_playlist_entries, args=(url, row_dict)).start()
-            else:
-                row_dict["status"].configure(text="Чтение доступных разрешений...", text_color="#F39C12")
-                threading.Thread(target=self.fetch_video_resolutions, args=(url, row_dict)).start()
+        if self._is_playlist(url):
+            row.set_status("Обнаружен плейлист. Чтение структуры...", Config.COLOR_WARN)
+            threading.Thread(target=self._bg_fetch_playlist, args=(url, row), daemon=True).start()
+        else:
+            row.set_status("Чтение доступных разрешений...", Config.COLOR_WARN)
+            threading.Thread(target=self._bg_fetch_resolutions, args=(url, row), daemon=True).start()
 
-    def fetch_playlist_entries(self, url, row_dict):
-        """Фоновое извлечение плоского списка треков из плейлиста."""
-        ydl_opts = {
-            "extract_flat": True,  # Забирает структуру мгновенно без анализа медиа-потоков
-            "skip_download": True,
-            "nocheckcertificate": True,
-            "quiet": True,
-            "extractor_args": {"youtube": {"player_client": ["web_safari"]}},
-        }
-        if self.manual_cookies_path and os.path.exists(self.manual_cookies_path):
-            ydl_opts["cookiefile"] = self.manual_cookies_path
+    # ------------------------------------------------------------------
+    # Фоновые задачи
+    # ------------------------------------------------------------------
 
+    def _bg_fetch_playlist(self, url: str, row: DownloadRow) -> None:
         try:
-            with YoutubeDL(ydl_opts) as ydl:
-                playlist_info = ydl.extract_info(url, download=False)
-                entries = playlist_info.get("entries", [])
-
+            entries = self._ydl.fetch_playlist_entries(url)
             if entries:
-                # Открываем модальное окно в основном потоке GUI
-                self.after(0, lambda: PlaylistWindow(
-                    self, entries, lambda urls: self.handle_selected_playlist_videos(row_dict, urls)
-                ))
+                self.after(
+                    0,
+                    lambda: PlaylistWindow(
+                        self, entries,
+                        callback=lambda urls: self._integrate_playlist_urls(row, urls),
+                    ),
+                )
             else:
-                self.after(0, lambda: row_dict["status"].configure(text="Плейлист пуст или скрыт", text_color="#C0392B"))
-        except Exception as e:
-            self.after(0, lambda: row_dict["status"].configure(text="Ошибка разбора плейлиста", text_color="#C0392B"))
-            print(f"Ошибка плейлиста: {e}")
+                self.after(0, lambda: row.set_status("Плейлист пуст или скрыт", Config.COLOR_ERR))
+        except Exception as exc:
+            log.exception("Ошибка разбора плейлиста: %s", exc)
+            self.after(0, lambda: row.set_status("Ошибка разбора плейлиста", Config.COLOR_ERR))
 
-    def handle_selected_playlist_videos(self, target_row, urls):
-        """Интегрирует выбранные из плейлиста видео в рабочую область GUI."""
+    def _integrate_playlist_urls(self, target_row: DownloadRow, urls: list[str]) -> None:
         if not urls:
-            target_row["status"].configure(text="Отменено: видео не выбраны", text_color="#BBBBBB")
+            target_row.set_status("Отменено: видео не выбраны", "#BBBBBB")
             return
-
-        # Первое видео перезаписываем в текущую активную строку
-        target_row["entry"].delete(0, "end")
-        target_row["entry"].insert(0, urls[0])
-        self.on_link_changed(target_row)
-
-        # Все последующие видео генерируем как новые независимые строки
+        # Первый URL — в текущую строку
+        target_row.entry.delete(0, "end")
+        target_row.entry.insert(0, urls[0])
+        self._on_link_changed(target_row)
+        # Остальные — новые строки
         for url in urls[1:]:
-            self.add_download_row()
-            new_row = self.download_rows[-1]
-            new_row["entry"].insert(0, url)
-            self.on_link_changed(new_row)
+            self._add_row()
+            new_row = self.rows[-1]
+            new_row.entry.insert(0, url)
+            self._on_link_changed(new_row)
 
-    def fetch_video_resolutions(self, url, row_dict):
-        ydl_opts = {
-            "nocheckcertificate": True, "quiet": True,
-            "extractor_args": {"youtube": {"player_client": ["web_safari"]}},
-        }
-        if self.manual_cookies_path and os.path.exists(self.manual_cookies_path):
-            ydl_opts["cookiefile"] = self.manual_cookies_path
-
+    def _bg_fetch_resolutions(self, url: str, row: DownloadRow) -> None:
         try:
-            with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                formats = info.get("formats", [])
+            heights = self._ydl.fetch_resolutions(url)
+            values = ["Максимальное"] + [f"{h}p" for h in heights]
+            self.after(0, lambda: self._apply_resolution_menu(row, values))
+        except Exception as exc:
+            log.exception("Ошибка получения форматов: %s", exc)
+            self.after(0, lambda: row.set_status("Защита от ботов / Нет формата", Config.COLOR_ERR))
 
-            resolutions = set()
-            for f in formats:
-                if f.get("vcodec") != "none" and f.get("height"):
-                    resolutions.add(f.get("height"))
+    def _apply_resolution_menu(self, row: DownloadRow, values: list[str]) -> None:
+        row.quality_menu.configure(values=values)
+        row.quality_menu.set(values[0])
+        row.set_status("Форматы успешно загружены", Config.COLOR_OK)
+        if not row.audio_only:
+            row.quality_menu.configure(state="normal")
 
-            sorted_res = sorted(list(resolutions), reverse=True)
-            dropdown_values = ["Максимальное"] + [f"{r}p" for r in sorted_res]
-            self.after(0, lambda: self.update_quality_menu(row_dict, dropdown_values))
-        except Exception as e:
-            self.after(0, lambda: row_dict["status"].configure(text="Защита от ботов / Нет формата", text_color="#C0392B"))
+    # ------------------------------------------------------------------
+    # Загрузка
+    # ------------------------------------------------------------------
 
-    def update_quality_menu(self, row_dict, values):
-        row_dict["quality_menu"].configure(values=values)
-        row_dict["quality_menu"].set(values[0])
-        row_dict["status"].configure(text="Форматы успешно загружены", text_color="#27AE60")
-        if not row_dict["audio_only_var"].get():
-            row_dict["quality_menu"].configure(state="normal")
-
-    def choose_cookies_file(self):
-        file_path = ctk.filedialog.askopenfilename(
-            title="Выберите файл cookies.txt", filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")]
-        )
-        if file_path:
-            self.manual_cookies_path = file_path
-            self.cookies_button.configure(text="Куки: Активны", text_color="#27AE60")
-
-    def start_all_downloads(self):
-        self.download_button.configure(state="disabled")
-        for row in self.download_rows:
-            url = row["entry"].get().strip()
-            if not url:
-                row["status"].configure(text="Пропущено: пустая ссылка", text_color="#C0392B")
+    def _start_all(self) -> None:
+        self._dl_button.configure(state="disabled")
+        for row in self.rows:
+            if not row.url:
+                row.set_status("Пропущено: пустая ссылка", Config.COLOR_ERR)
                 continue
+            row.set_status("В очереди...", Config.COLOR_WARN)
+            row.lock()
+            self._manager.submit(self._download_task, row)
+        self.after(1000, lambda: self._dl_button.configure(state="normal"))
 
-            row["status"].configure(text="В очереди...", text_color="#F39C12")
-            row["entry"].configure(state="disabled")
-            row["checkbox"].configure(state="disabled")
-            row["quality_menu"].configure(state="disabled")
-            row["delete_btn"].configure(state="disabled")
+    def _download_task(self, row: DownloadRow) -> None:
+        self.after(0, lambda: row.set_status("Анализ...", Config.COLOR_WARN))
+        row.reset_cancel()
 
-            self.executor.submit(self.download_video, url, row)
-        self.after(1000, lambda: self.download_button.configure(state="normal"))
+        def hook(d: dict) -> None:
+            if row.cancel_event.is_set():
+                raise Exception("Отменено пользователем")
+            self._progress_hook(d, row)
 
-    def download_video(self, url, row):
-        audio_only = row["audio_only_var"].get()
-        selected_quality = row["quality_menu"].get()
-        row["status"].configure(text="Анализ...", text_color="#F39C12")
-
-        ydl_opts = {
-            "outtmpl": os.path.join(self.download_path, "%(title)s.%(ext)s"),
-            "progress_hooks": [lambda d: self.progress_hook(d, row)],
-            "nocheckcertificate": True,
-            "retries": 15, "fragment_retries": 15, "socket_timeout": 45, "ignoreerrors": True,
-            "extractor_args": {"youtube": {"player_client": ["web_safari"]}},
-        }
-        if shutil.which("node"):
-            ydl_opts["javascript_runtimes"] = ["node"]
-
-        if self.manual_cookies_path and os.path.exists(self.manual_cookies_path):
-            ydl_opts["cookiefile"] = self.manual_cookies_path
-        else:
-            try: ydl_opts["cookiesfrombrowser"] = ("firefox",)
-            except Exception: ydl_opts.pop("cookiesfrombrowser", None)
-
-        if audio_only:
-            ydl_opts["format"] = "bestaudio/best"
-            if self.ffmpeg_available:
-                ydl_opts["postprocessors"] = [{
-                    "key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"
-                }]
-        else:
-            if selected_quality == "Максимальное" or not self.ffmpeg_available:
-                ydl_opts["format"] = "bestvideo+bestaudio/best" if self.ffmpeg_available else "best"
-            else:
-                height = selected_quality.replace("p", "")
-                ydl_opts["format"] = f"bestvideo[height<={height}]+bestaudio/best"
-            ydl_opts["merge_output_format"] = "mp4"
+        opts = self._ydl.build_download_opts(
+            output_dir=self.download_path,
+            audio_only=row.audio_only,
+            selected_quality=row.selected_quality,
+            progress_hook=hook,
+            cancel_event=row.cancel_event,
+        )
 
         try:
-            with YoutubeDL(ydl_opts) as ydl:
-                result = ydl.download([url])
-                if result == 0:
-                    row["status"].configure(text="Готово!", text_color="#27AE60")
-                    row["progress"].set(1)
-                else: raise Exception("Блокировка")
-        except Exception as e:
-            error_str = str(e).lower()
-            if "sign in" in error_str or "bot" in error_str:
-                row["status"].configure(text="Бот-блок! Нужен куки .txt", text_color="#C0392B")
+            success = self._ydl.download(row.url, opts)
+            if success:
+                self.after(0, lambda: (row.set_status("Готово!", Config.COLOR_OK), row.set_progress(1.0)))
             else:
-                row["status"].configure(text="Ошибка соединения", text_color="#C0392B")
+                raise RuntimeError("yt-dlp вернул ненулевой код")
+        except Exception as exc:
+            err = str(exc).lower()
+            if "отменено" in err:
+                self.after(0, lambda: row.set_status("Отменено", Config.COLOR_MUTED))
+            elif "sign in" in err or "bot" in err:
+                self.after(0, lambda: row.set_status("Бот-блок! Нужен куки .txt", Config.COLOR_ERR))
+            else:
+                log.exception("Ошибка загрузки: %s", exc)
+                self.after(0, lambda: row.set_status("Ошибка соединения", Config.COLOR_ERR))
         finally:
-            row["entry"].configure(state="normal")
-            row["checkbox"].configure(state="normal")
-            self.toggle_audio_mode(row)
-            self.update_delete_buttons_state()
+            self.after(0, lambda: (row.unlock(self.ffmpeg_ok), self._refresh_delete_states()))
 
-    def remove_download_row(self, row_dict):
-        if len(self.download_rows) > 1:
-            row_dict["frame"].destroy()
-            self.download_rows.remove(row_dict)
-            self.update_delete_buttons_state()
-
-    def update_delete_buttons_state(self):
-        state = "normal" if len(self.download_rows) > 1 else "disabled"
-        for row in self.download_rows:
-            row["delete_btn"].configure(state=state)
-
-    def check_system_dependencies(self):
-        if shutil.which("ffmpeg"):
-            self.ffmpeg_label.configure(text="FFmpeg: ОК", text_color="#27AE60")
-            self.ffmpeg_available = True
-        else:
-            self.ffmpeg_label.configure(text="FFmpeg: НЕ НАЙДЕН (Ограничение 720p/Аудио)", text_color="#C0392B")
-            self.ffmpeg_available = False
-        if shutil.which("node"):
-            self.nodejs_label.configure(text="Node.js: ОК", text_color="#27AE60")
-        else:
-            self.nodejs_label.configure(text="Node.js: НЕ НАЙДЕН", text_color="#C0392B")
-
-    def create_context_menu(self):
-        self.context_menu = tk.Menu(self, tearoff=0, background="#000000", foreground="#FFFFFF", activebackground="#222222", activeforeground="#FFFFFF")
-        self.context_menu.add_command(label="Вставить", command=self.paste_from_clipboard)
-        self.context_menu.add_command(label="Очистить", command=self.clear_entry)
-
-    def show_context_menu(self, event):
-        self.active_entry = event.widget
-        self.active_entry.focus()
-        self.context_menu.tk_popup(event.x_root, event.y_root)
-
-    def is_valid_youtube_link(self, text):
-        if not text or len(text) > 250 or "\n" in text or "\r" in text: return False
-        return "youtube.com" in text.lower() or "youtu.be" in text.lower()
-
-    def check_clipboard_on_start(self):
-        try:
-            clipboard_content = self.clipboard_get().strip()
-            if self.is_valid_youtube_link(clipboard_content) and self.download_rows:
-                self.download_rows[0]["entry"].insert(0, clipboard_content)
-                self.on_link_changed(self.download_rows[0])
-        except Exception: pass
-
-    def paste_from_clipboard(self):
-        try:
-            text = self.clipboard_get().strip()
-            if len(text) > 500: return
-            if hasattr(self, "active_entry"):
-                self.active_entry.delete(0, "end")
-                self.active_entry.insert(0, text)
-                for row in self.download_rows:
-                    if row["entry"] == self.active_entry:
-                        self.on_link_changed(row)
-                        break
-        except Exception: pass
-
-    def clear_entry(self):
-        if hasattr(self, "active_entry"): self.active_entry.delete(0, "end")
-
-    def choose_path(self):
-        directory = ctk.filedialog.askdirectory(initialdir=self.download_path)
-        if directory:
-            self.download_path = directory
-            self.path_label.configure(text=f"Папка: {directory}")
-
-    def progress_hook(self, d, row):
-        if d["status"] == "downloading":
+    def _progress_hook(self, d: dict, row: DownloadRow) -> None:
+        status = d.get("status")
+        if status == "downloading":
             downloaded = d.get("downloaded_bytes", 0)
             total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
             if total > 0:
-                percent = downloaded / total
-                row["progress"].set(percent)
-                speed = d.get("_speed_str", "N/A")
-                row["status"].configure(text=f"{speed}", text_color="#FFFFFF")
-        elif d["status"] == "finished":
-            audio_only = row["audio_only_var"].get()
-            if self.ffmpeg_available:
-                status_text = "Конвертация в MP3..." if audio_only else "Склейка FFmpeg..."
-                row["status"].configure(text=status_text, text_color="#F39C12")
-            else: row["status"].configure(text="Сохранение...", text_color="#F39C12")
+                self.after(0, lambda: row.set_progress(downloaded / total))
+            speed = d.get("_speed_str", "")
+            if speed:
+                self.after(0, lambda: row.set_status(speed, Config.COLOR_WHITE))
+        elif status == "finished":
+            if self.ffmpeg_ok:
+                label = "Конвертация в MP3..." if row.audio_only else "Склейка FFmpeg..."
+            else:
+                label = "Сохранение..."
+            self.after(0, lambda: row.set_status(label, Config.COLOR_WARN))
+
+    # ------------------------------------------------------------------
+    # Настройки
+    # ------------------------------------------------------------------
+
+    def _choose_path(self) -> None:
+        directory = ctk.filedialog.askdirectory(initialdir=self.download_path)
+        if directory:
+            self.download_path = directory
+            self._path_label.configure(text=f"Папка: {directory}")
+
+    def _choose_cookies(self) -> None:
+        path = ctk.filedialog.askopenfilename(
+            title="Выберите файл cookies.txt",
+            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")],
+        )
+        if path:
+            self._ydl.cookies_path = path
+            # Найти кнопку куки и обновить текст
+            for widget in self.winfo_children():
+                if isinstance(widget, ctk.CTkFrame):
+                    for child in widget.winfo_children():
+                        if isinstance(child, ctk.CTkButton) and "Куки" in str(child.cget("text")):
+                            child.configure(text="Куки: Активны", text_color=Config.COLOR_OK)
+
+    # ------------------------------------------------------------------
+    # Буфер обмена
+    # ------------------------------------------------------------------
+
+    def _paste_clipboard_on_start(self) -> None:
+        try:
+            text = self.clipboard_get().strip()
+            if self._is_youtube(text) and self.rows:
+                self.rows[0].entry.insert(0, text)
+                self._on_link_changed(self.rows[0])
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Контекстное меню
+    # ------------------------------------------------------------------
+
+    def _create_context_menu(self) -> None:
+        self._ctx_menu = tk.Menu(
+            self, tearoff=0,
+            background=Config.COLOR_BG, foreground=Config.COLOR_WHITE,
+            activebackground="#222222", activeforeground=Config.COLOR_WHITE,
+        )
+        self._ctx_menu.add_command(label="Вставить", command=self._ctx_paste)
+        self._ctx_menu.add_command(label="Очистить", command=self._ctx_clear)
+        self._active_entry: ctk.CTkEntry | None = None
+
+    def _show_context_menu(self, event: tk.Event) -> None:
+        self._active_entry = event.widget
+        self._active_entry.focus()
+        self._ctx_menu.tk_popup(event.x_root, event.y_root)
+
+    def _ctx_paste(self) -> None:
+        if not self._active_entry:
+            return
+        try:
+            text = self.clipboard_get().strip()
+            if len(text) > 500:
+                return
+            self._active_entry.delete(0, "end")
+            self._active_entry.insert(0, text)
+            for row in self.rows:
+                if row.entry == self._active_entry:
+                    self._on_link_changed(row)
+                    break
+        except Exception:
+            pass
+
+    def _ctx_clear(self) -> None:
+        if self._active_entry:
+            self._active_entry.delete(0, "end")
+
+    # ------------------------------------------------------------------
+    # Жизненный цикл
+    # ------------------------------------------------------------------
+
+    def _on_close(self) -> None:
+        for row in self.rows:
+            row.cancel_event.set()
+        self._manager.shutdown()
+        self.destroy()
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    app = YoutubeDownloaderApp()
+    app = App()
     app.mainloop()
